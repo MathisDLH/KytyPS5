@@ -11,6 +11,7 @@
 
 namespace Libs::Graphics {
 class CommandBuffer;
+class GuestGpu;
 class Presenter;
 } // namespace Libs::Graphics
 
@@ -38,7 +39,9 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
-	void WaitFlipDone(int handle, int index);
+	bool IsFlipPending(int handle, int index);
+	// Completed flips wake the attached GPU's suspended queues; detach before destroying it.
+	void SetGpu(Graphics::GuestGpu* gpu);
 
 	[[nodiscard]] Impl& State() noexcept;
 

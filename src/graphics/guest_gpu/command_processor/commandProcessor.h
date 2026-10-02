@@ -177,6 +177,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	bool      m_waiting_flip                = false;
 };
 
 } // namespace Libs::Graphics
