@@ -92,6 +92,84 @@ std::filesystem::path MutateArchive(const std::filesystem::path &source,
   return destination;
 }
 
+void CheckHostFile(const std::filesystem::path &directory) {
+  const auto path = directory / "host.bin";
+  std::vector<uint8_t> payload(64 * 1024 + 11);
+  for (size_t index = 0; index < payload.size(); index++) {
+    payload[index] = static_cast<uint8_t>((index * 13 + 5) & 0xff);
+  }
+
+  Common::File output;
+  Check(output.Create(path) && !output.HasPositionalRead(),
+        "writable host files read at an offset by seeking");
+  uint32_t bytes = 0;
+  output.Write(payload.data(), 100, &bytes);
+  Check(bytes == 100 && output.Size() == 100, "size follows a write");
+  std::array<uint8_t, 97> slice{};
+  output.ReadAt(slice.data(), 16, 0, &bytes);
+  Check(bytes == 16 && std::equal(slice.begin(), slice.begin() + 16, payload.begin()) &&
+            output.Tell() == 100,
+        "offset read sees buffered writes and keeps the position");
+  output.Write(payload.data() + 100, static_cast<uint32_t>(payload.size() - 100), &bytes);
+  Check(output.Size() == payload.size(), "size follows a write after an offset read");
+  Check(output.Seek(10), "seek inside the written file");
+  output.Write(payload.data() + 10, 5, &bytes);
+  Check(output.Size() == payload.size(), "overwriting keeps the size");
+  Check(output.Truncate(payload.size() + 7) && output.Size() == payload.size() + 7 &&
+            output.Truncate(payload.size()) && output.Size() == payload.size(),
+        "size follows truncation in both directions");
+  output.Close();
+  Check(std::filesystem::file_size(path) == payload.size(), "host file keeps the written size");
+
+  Common::File input(path, Common::File::Mode::Read);
+  Check(!input.IsInvalid() && input.Size() == payload.size(), "open host file read-only");
+#if !defined(_WIN32)
+  Check(input.HasPositionalRead(), "read-only host files read positionally");
+#endif
+  Check(input.Seek(5), "position the read-only file");
+  constexpr uint32_t Offset = 32 * 1024 - 19;
+  input.ReadAt(slice.data(), static_cast<uint32_t>(slice.size()), Offset, &bytes);
+  Check(bytes == slice.size() &&
+            std::equal(slice.begin(), slice.end(), payload.begin() + Offset) &&
+            input.Tell() == 5,
+        "offset read keeps the file position");
+  input.Read(slice.data(), static_cast<uint32_t>(slice.size()), &bytes);
+  Check(bytes == slice.size() && std::equal(slice.begin(), slice.end(), payload.begin() + 5),
+        "sequential read continues after an offset read");
+  input.ReadAt(slice.data(), static_cast<uint32_t>(slice.size()), payload.size() - 9, &bytes);
+  Check(bytes == 9 && std::equal(slice.begin(), slice.begin() + 9, payload.end() - 9),
+        "offset read stops at end of file");
+  input.ReadAt(slice.data(), static_cast<uint32_t>(slice.size()), payload.size() + 100, &bytes);
+  Check(bytes == 0, "offset read past end of file returns no data");
+
+  if (input.HasPositionalRead()) {
+    std::atomic_bool reads_ok = true;
+    std::vector<std::thread> readers;
+    for (uint32_t worker = 0; worker < 8; worker++) {
+      readers.emplace_back([&, worker] {
+        std::array<uint8_t, 4096> data{};
+        for (uint32_t iteration = 0; iteration < 32; iteration++) {
+          const auto offset = static_cast<size_t>(worker * 7919 + iteration * 12347) %
+                              (payload.size() - data.size());
+          uint32_t read = 0;
+          input.ReadAt(data.data(), static_cast<uint32_t>(data.size()), offset, &read);
+          if (read != data.size() ||
+              !std::equal(data.begin(), data.end(),
+                          payload.begin() + static_cast<std::ptrdiff_t>(offset))) {
+            reads_ok = false;
+            return;
+          }
+        }
+      });
+    }
+    for (auto &reader : readers) {
+      reader.join();
+    }
+    Check(reads_ok && input.Tell() == 5 + slice.size(),
+          "concurrent positional reads share one handle without moving it");
+  }
+}
+
 void CheckMalformedArchives(const std::filesystem::path &source,
                             const std::vector<uint8_t> &payload) {
   const auto bad_name = MutateArchive(source, "bad-name.zar", [](auto &bytes, auto &footer) {
@@ -210,6 +288,7 @@ int main() {
   Check(!Common::File::GetInfo(archive_path / "") && Common::File::Size(archive_path / "") == 0 &&
             !Common::File::GetInfo(temporary.Path() / "missing.bin"),
         "reject missing native paths and files with a trailing separator");
+  CheckHostFile(temporary.Path());
 
   const auto root = Common::MakeArchivePath(archive_path);
   auto reader_pin = Common::OpenArchive(archive_path);
@@ -275,6 +354,13 @@ int main() {
   Check(
       std::equal(slice.begin(), slice.end(), payload.begin() + 64 * 1024 - 19),
       "preserve data across compression block boundary");
+  Check(file.Seek(3) && !file.HasPositionalRead(), "archive members read at an offset by seeking");
+  slice.assign(slice.size(), 0);
+  file.ReadAt(slice.data(), static_cast<uint32_t>(slice.size()), 64 * 1024 - 19, &bytes_read);
+  Check(bytes_read == slice.size() &&
+            std::equal(slice.begin(), slice.end(), payload.begin() + 64 * 1024 - 19) &&
+            file.Tell() == 3,
+        "archive offset read keeps the member position");
 
   Check(file.Seek(payload.size() - 9), "seek near member end");
   file.Read(slice.data(), static_cast<uint32_t>(slice.size()), &bytes_read);
