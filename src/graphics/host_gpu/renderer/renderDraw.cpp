@@ -535,7 +535,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		auto layout = depth_attachment_layout(depth);
+		// Read-only layouts only matter when the draw samples its own depth target.
+		auto layout =
+		    sampled_aspects ? depth_attachment_layout(depth) : depth_writable_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT

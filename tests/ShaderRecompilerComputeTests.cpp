@@ -34724,6 +34724,18 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal,
           "combined depth/stencil writes did not use the writable layout");
+  RenderDepthInfo read_only_pass{};
+  read_only_pass.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  RenderDepthInfo depth_only_pass{};
+  depth_only_pass.desc.view_info.format = vk::Format::eD32Sfloat;
+  Require("DynamicRenderingState", "pass-stable depth/stencil layout",
+          depth_writable_layout(read_only_pass) ==
+                  vk::ImageLayout::eDepthStencilAttachmentOptimal &&
+              depth_writable_layout(attachment) ==
+                  depth_writable_layout(read_only_pass) &&
+              depth_writable_layout(depth_only_pass) ==
+                  vk::ImageLayout::eDepthAttachmentOptimal,
+          "toggling depth or stencil writes changed the shared pass layout");
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
