@@ -60,8 +60,44 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
+static bool RequestsClear(const RenderState& state) {
+	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
+		if (state.color_attachments[i].is_clear) {
+			return true;
+		}
+	}
+	const auto& depth_stencil = state.depth_stencil_attachment;
+	return (depth_stencil.has_depth && depth_stencil.depth_clear) ||
+	       (depth_stencil.has_stencil && depth_stencil.stencil_clear);
+}
+
+static bool SameAttachment(const RenderAttachment& a, const RenderAttachment& b) {
+	return a.image_view == b.image_view && a.image_layout == b.image_layout &&
+	       a.has_depth == b.has_depth && a.has_stencil == b.has_stencil;
+}
+
+static bool SameTargets(const RenderState& a, const RenderState& b) {
+	if (a.width != b.width || a.height != b.height || a.num_layers != b.num_layers ||
+	    a.num_color_attachments != b.num_color_attachments ||
+	    !SameAttachment(a.depth_stencil_attachment, b.depth_stencil_attachment)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < a.num_color_attachments; i++) {
+		if (!SameAttachment(a.color_attachments[i], b.color_attachments[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
+		return;
+	}
+	// A draw that only loads the targets can continue a pass that began by clearing them: the
+	// clear already ran. Track the pass as loading so that a later clear starts a new one.
+	if (m_rendering && !RequestsClear(state) && SameTargets(m_render_state, state)) {
+		m_render_state = state;
 		return;
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
