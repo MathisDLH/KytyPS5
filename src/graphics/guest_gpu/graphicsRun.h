@@ -39,6 +39,8 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
+	// Retry suspended queues now rather than after the poll interval, e.g. once a flip completes.
+	void WakeBlockedQueues();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
@@ -85,6 +87,7 @@ private:
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
+	bool                                           m_retry_blocked     = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;

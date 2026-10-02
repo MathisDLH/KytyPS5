@@ -215,7 +215,8 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
+	bool IsPending(const VideoOutConfig& cfg, int index);
+	void SetGpu(Graphics::GuestGpu* gpu);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -236,6 +237,7 @@ private:
 	};
 
 	Graphics::Presenter& m_presenter;
+	Graphics::GuestGpu*  m_gpu = nullptr;
 	Common::Mutex        m_mutex;
 	Common::CondVar      m_submit_cond_var;
 	Common::CondVar      m_submit_slot_cond_var;
@@ -1185,17 +1187,17 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+bool FlipQueue::IsPending(const VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
-	};
-	while (has_request()) {
-		m_done_cond_var.Wait(&m_mutex);
-	}
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+}
+
+void FlipQueue::SetGpu(Graphics::GuestGpu* gpu) {
+	Common::LockGuard lock(m_mutex);
+	m_gpu = gpu;
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
@@ -1276,6 +1278,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_processing = false;
 	m_done_cond_var.SignalAll();
 	m_submit_slot_cond_var.SignalAll();
+	// A GPU queue may be suspended until one of these flips completes.
+	if (due && m_gpu != nullptr) {
+		m_gpu->WakeBlockedQueues();
+	}
 	m_mutex.Unlock();
 	for (size_t i = count; i != 0; i--) {
 		requests[i - 1].cfg->mutex.Unlock();
@@ -1630,12 +1636,19 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
+bool VideoOutDriver::IsFlipPending(int handle, int index) {
 	auto* ctx = m_impl->Get(handle);
-	EXIT_IF(ctx == nullptr);
+	if (ctx == nullptr) {
+		// Closing a port cancels its queued flips.
+		return false;
+	}
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	return m_impl->GetFlipQueue().IsPending(*ctx, index);
+}
+
+void VideoOutDriver::SetGpu(Graphics::GuestGpu* gpu) {
+	m_impl->GetFlipQueue().SetGpu(gpu);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

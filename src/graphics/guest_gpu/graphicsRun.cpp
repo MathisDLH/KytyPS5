@@ -431,6 +431,12 @@ void GuestGpu::Enqueue(Submission submission) {
 	m_work_available.Signal();
 }
 
+void GuestGpu::WakeBlockedQueues() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_retry_blocked = true;
+	m_work_available.Signal();
+}
+
 void GuestGpu::WaitForIdle() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
@@ -478,7 +484,11 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					// WakeBlockedQueues may have run before this wait; do not sleep through it.
+					if (!gpu->m_retry_blocked) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
+					gpu->m_retry_blocked = false;
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -1054,10 +1064,16 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	BufferFlush();
+	// Suspend rather than block the GPU thread; only the first attempt flushes.
+	if (!m_waiting_flip) {
+		BufferFlush();
+	}
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	m_waiting_flip = m_renderer.GetVideoOut().IsFlipPending(static_cast<int>(video_out_handle),
+	                                                        static_cast<int>(display_buffer_index));
+	if (m_waiting_flip) {
+		SuspendPm4();
+	}
 }
 
 template <typename T>

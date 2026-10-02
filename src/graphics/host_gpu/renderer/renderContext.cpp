@@ -28,11 +28,17 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	if (m_video_out != nullptr) {
+		m_video_out->SetGpu(m_gpu.get());
+	}
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		if (m_video_out != nullptr) {
+			m_video_out->SetGpu(nullptr);
+		}
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
