@@ -309,7 +309,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				     "src_fmt=%u dst=v%u regs=%u"
 				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
 				     log_id, index, input_attr[index].binding, input_attr[index].offset,
-				     input_desc[input_attr[index].binding].stride,
+				     vs_input_info.buffers[input_attr[index].binding].stride,
 				     static_cast<int>(input_attr[index].format),
 				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
 				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
@@ -341,25 +341,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.topology = static_params.topology;
-	input_assembly.primitiveRestartEnable =
-	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
 
 	vk::PipelineViewportStateCreateInfo viewport_state {};
 	viewport_state.pNext = &depth_clip_control;
-
-	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
-	if (static_params.cull_back) {
-		cull_mode |= vk::CullModeFlagBits::eBack;
-	}
-	if (static_params.cull_front) {
-		cull_mode |= vk::CullModeFlagBits::eFront;
-	}
-
-	vk::FrontFace front_face =
-	    (static_params.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
 
 	vk::PipelineRasterizationDepthClipStateCreateInfoEXT clip_ext {};
 	clip_ext.depthClipEnable = static_params.depth_clip_enable ? VK_TRUE : VK_FALSE;
@@ -381,8 +368,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		provoking_vertex.pNext = rasterizer.pNext;
 		rasterizer.pNext = &provoking_vertex;
 	}
-	rasterizer.cullMode  = cull_mode;
-	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
 	rasterizer.lineWidth = 1.0f;
 
@@ -489,6 +474,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eViewportWithCount,
 	    vk::DynamicState::eScissorWithCount,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eCullMode,
+	    vk::DynamicState::eFrontFace,
 	    vk::DynamicState::eDepthTestEnable,
 	    vk::DynamicState::eDepthWriteEnable,
 	    vk::DynamicState::eDepthCompareOp,
@@ -501,6 +488,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
+	// Mesh pipelines have no input assembly or vertex input state.
+	if (!mesh) {
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveTopology);
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveRestartEnable);
+		if (PIPELINE_DYNAMIC_VERTEX_STRIDE && vertex_input.binding_count != 0) {
+			dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
+		}
+	}
 #if !defined(__APPLE__)
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);

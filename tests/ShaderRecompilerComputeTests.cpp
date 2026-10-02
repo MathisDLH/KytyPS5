@@ -14393,9 +14393,11 @@ public:
     const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
                               bool provoking_last = false,
                               bool clockwise = false,
-                              vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList)
+                              vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList,
+                              bool cull_front = false)
         -> PipelineCache::Pipeline & {
       HW::ModeControl mode{};
+      mode.cull_front = cull_front;
       mode.face = clockwise;
       mode.poly_mode = enabled;
       mode.polymode_front_ptype = front;
@@ -14404,11 +14406,11 @@ public:
       registers.SetModeControl(mode);
       return context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
-          topology, false,
-          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+          topology, PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
+    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+                          vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -14444,6 +14446,12 @@ public:
       cmd.setViewportWithCount(1, &viewport);
       cmd.setScissorWithCount(1, &scissor);
       cmd.setLineWidth(1);
+      const auto &mode = registers.GetModeControl();
+      cmd.setCullMode((mode.cull_front ? vk::CullModeFlagBits::eFront : vk::CullModeFlags{}) |
+                      (mode.cull_back ? vk::CullModeFlagBits::eBack : vk::CullModeFlags{}));
+      cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
+      cmd.setPrimitiveTopology(topology);
+      cmd.setPrimitiveRestartEnable(false);
       cmd.setDepthTestEnable(depth.depth_test_enable);
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
@@ -14465,7 +14473,9 @@ public:
       cmd.setColorWriteEnableEXT(1, &write);
       cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
       const vk::DeviceSize offset = 0;
-      cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
+      const vk::DeviceSize stride = vertex.buffers[0].stride;
+      cmd.bindVertexBuffers2(0, 1, &buffer.buffer, &offset, nullptr,
+                             PIPELINE_DYNAMIC_VERTEX_STRIDE ? &stride : nullptr);
       cmd.draw(vertex_count, 1, 0, 0);
       command.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -14510,6 +14520,29 @@ public:
                   pipeline(true, 2, 2).pipeline == filled.pipeline &&
                   pipeline(false, 1, 0).pipeline == filled.pipeline,
               "polygon mode was lost from the cache key or dormant face modes were applied");
+      // Cull mode, front face, the topology within its class and vertex strides are draw state.
+      // Apple keeps the exact topology in the key for MoltenVK's topology emulation.
+#if defined(__APPLE__)
+      constexpr bool topology_class_shared = false;
+#else
+      constexpr bool topology_class_shared = true;
+#endif
+      Require(name, "dynamic rasterizer pipeline cache",
+              pipeline(true, 2, 2, false, true).pipeline == filled.pipeline &&
+                  pipeline(true, 1, 2, false, false, vk::PrimitiveTopology::eTriangleList, true)
+                          .pipeline == filled.pipeline &&
+                  (pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip)
+                           .pipeline == filled.pipeline) == topology_class_shared &&
+                  (pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleFan)
+                           .pipeline == filled.pipeline) == topology_class_shared &&
+                  pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eLineStrip)
+                          .pipeline != filled.pipeline,
+              "draw-time rasterizer state split the pipeline cache or merged topology classes");
+      vertex.buffers[0].stride = 8 * sizeof(float);
+      const bool stride_shared = pipeline(true, 2, 2).pipeline == filled.pipeline;
+      vertex.buffers[0].stride = 6 * sizeof(float);
+      Require(name, "vertex stride pipeline cache", stride_shared == PIPELINE_DYNAMIC_VERTEX_STRIDE,
+              "vertex buffer strides were not handled as dynamic pipeline state");
       draw(wireframe);
       const auto line_pixels = read_color();
       const auto interior = 4 * (16 * extent + 16);
@@ -14824,7 +14857,8 @@ public:
         vertex_shader = programs.vertex[0];
         pixel_shader = programs.pixel;
         vertex = native_vertex_info[0];
-        draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4);
+        draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4,
+             vk::PrimitiveTopology::eTriangleStrip);
         const auto pixels = read_color();
         bool second_triangle = false;
         for (size_t component = 0; component < pixels.size(); component += 4) {
@@ -14981,6 +15015,22 @@ public:
                 "MRT3 was compacted to a different slot or clipped by unused MRT0");
       }
 
+      // Cull mode and front face are draw state: the clockwise fullscreen triangle is culled
+      // as a back face, then kept once clockwise triangles face front.
+      for (const bool clockwise : {false, true}) {
+        registers.SetModeControl({.cull_back = true, .face = clockwise});
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto culled_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                   {}, {extent, extent, 1});
+        Require(name, "dynamic cull mode and front face",
+                std::ranges::all_of(culled_pixels, [&](u32 v) { return (v != 0) == clockwise; }),
+                "the draw did not apply its cull mode and front face");
+      }
+      registers.SetModeControl({});
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -15033,7 +15083,8 @@ public:
         const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
                                     ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
         user_config.SetPrimitiveType(primitive);
-        registers.SetModeControl({});
+        // Rectangle lists ignore the guest cull mode.
+        registers.SetModeControl({.cull_front = true, .cull_back = true});
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
         RenderExecutorTestAccess::DrawAuto(
