@@ -23,6 +23,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -57,10 +58,24 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
+// __tls_get_addr resolves every thread_local access in a module, so each thread keeps its recent
+// lookups. Freeing any block bumps the generation, which drops every cached pointer.
+struct TlsCacheEntry {
+	const Program* program    = nullptr;
+	uint8_t*       ptr        = nullptr;
+	uint64_t       generation = 0;
+};
+
+static std::atomic<uint64_t>                     g_tls_generation {1};
+static thread_local std::array<TlsCacheEntry, 8> g_tls_cache {};
+static thread_local uint32_t                     g_tls_cache_next = 0;
+
 static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 	if (block == nullptr || block->ptr == nullptr) {
 		return;
 	}
+
+	g_tls_generation.fetch_add(1, std::memory_order_acq_rel);
 
 	if (block->free_func != nullptr) {
 		block->free_func(block->ptr);
@@ -1721,6 +1736,13 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 	EXIT_IF(program == nullptr);
 
+	const auto generation = g_tls_generation.load(std::memory_order_acquire);
+	for (const auto& entry: g_tls_cache) {
+		if (entry.program == program && entry.generation == generation) {
+			return entry.ptr;
+		}
+	}
+
 	Common::LockGuard lock(program->tls.mutex);
 
 	auto& tls = program->tls.tlss[Common::Thread::GetThreadIdUnique()];
@@ -1753,6 +1775,7 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		tcb[0]    = reinterpret_cast<uint64_t>(tcb);
 	}
 
+	g_tls_cache[g_tls_cache_next++ % g_tls_cache.size()] = {program, tls.ptr, generation};
 	return tls.ptr;
 }
 
