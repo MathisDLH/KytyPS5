@@ -187,8 +187,15 @@ public:
 		    });
 	}
 
-	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+	struct SparsePiece {
+		uint64_t vaddr          = 0;
+		uint64_t size           = 0;
+		uint64_t backing_offset = 0;
+	};
+
+	// Resolves the mapped parts of a range; the gaps between them read as zeros.
+	bool ResolveSparseBacking(uint64_t vaddr, uint64_t size, std::vector<SparsePiece>* pieces) {
+		if (!IsAvailable() || pieces == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
@@ -201,34 +208,38 @@ public:
 				first = previous;
 			}
 		}
-		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
-		     ++mapping) {
-			const auto& entry = mapping->second;
-			const auto  start = std::max(vaddr, entry.vaddr);
-			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
-			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
-				return false;
-			}
-		}
-
-		auto* destination = static_cast<uint8_t*>(data);
-		auto  cursor      = vaddr;
+		pieces->clear();
 		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
 		     ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
 			const auto  offset = entry.backing_offset + start - entry.vaddr;
-			if (cursor < start) {
-				std::memset(destination + (cursor - vaddr), 0, start - cursor);
+			if (!RangeOk(offset, bytes)) {
+				return false;
 			}
-			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
-			cursor = start + bytes;
+			pieces->push_back({start, bytes, offset});
+		}
+		return true;
+	}
+
+	// The backing alias stays mapped for the lifetime of the store, so the copy needs no lock.
+	void CopySparseBacking(uint64_t vaddr, uint64_t size, const std::vector<SparsePiece>& pieces,
+	                       void* data) const {
+		auto*      destination = static_cast<uint8_t*>(data);
+		const auto end         = vaddr + size;
+		auto       cursor      = vaddr;
+		for (const auto& piece: pieces) {
+			if (cursor < piece.vaddr) {
+				std::memset(destination + (cursor - vaddr), 0, piece.vaddr - cursor);
+			}
+			std::memcpy(destination + (piece.vaddr - vaddr), m_backing_base + piece.backing_offset,
+			            piece.size);
+			cursor = piece.vaddr + piece.size;
 		}
 		if (cursor < end) {
 			std::memset(destination + (cursor - vaddr), 0, end - cursor);
 		}
-		return true;
 	}
 
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -738,21 +749,29 @@ public:
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (!Owns(vaddr, size)) {
+		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
-		auto            mapping = m_mapped.upper_bound(vaddr);
-		if (mapping != m_mapped.begin()) {
-			--mapping;
-		}
-		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
-			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+		std::vector<GuestBackingStore::SparsePiece> pieces;
+		{
+			std::lock_guard lock(m_mutex);
+			auto            mapping = m_mapped.upper_bound(vaddr);
+			if (mapping != m_mapped.begin()) {
+				--mapping;
+			}
+			for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
+				const auto& region = mapping->second;
+				if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+					return false;
+				}
+			}
+			if (!m_backing->ResolveSparseBacking(vaddr, size, &pieces)) {
 				return false;
 			}
 		}
-		return m_backing->TryReadSparseBacking(vaddr, data, size);
+		// Whole-image copies run outside the lock that every protection change takes.
+		m_backing->CopySparseBacking(vaddr, size, pieces, data);
+		return true;
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
