@@ -105,6 +105,7 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	bool                                             robust_buffer_dwords    = false;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
@@ -403,6 +404,8 @@ struct MemoryResourceAccess {
 	uint32_t              index_offset     = 0;
 	uint32_t              byte_offset      = 0;
 	bool                  add_index_offset = false;
+	// The device reads zero for out-of-bounds dword loads; stores still check bounds.
+	bool                  robust           = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 

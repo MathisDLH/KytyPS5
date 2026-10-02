@@ -320,8 +320,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  bool robust_buffer_dwords) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -342,6 +342,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	state.robust_buffer_dwords = robust_buffer_dwords;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

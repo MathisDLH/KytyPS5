@@ -341,6 +341,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.robust_buffer_dwords = robust_buffer_dwords;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -383,7 +384,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(vk::Device device, bool robust_buffer_dwords)
+	    : device(device), robust_buffer_dwords(robust_buffer_dwords) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -398,11 +400,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
-	uint64_t                                                    next_shader_id = 0;
+	// Fixed for the device, so compiled programs never need it in their key.
+	bool                                                        robust_buffer_dwords = false;
+	uint64_t                                                    next_shader_id       = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(
+                                graphics.device, graphics.robust_buffer_dwords_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

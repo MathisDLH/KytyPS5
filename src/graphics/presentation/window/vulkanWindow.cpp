@@ -492,6 +492,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	if (robustness2_ext_enabled) {
+		robustness2_properties.pNext = properties2.pNext;
+		properties2.pNext            = &robustness2_properties;
+	}
 	physical_device.getProperties2(&properties2);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
@@ -574,6 +579,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	// Shaders leave dword bounds to the device only when it checks storage buffers per dword.
+	graphics.robust_buffer_dwords_enabled =
+	    robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE &&
+	    robustness2_properties.robustStorageBufferAccessSizeAlignment <= sizeof(uint32_t);
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 #if defined(__APPLE__)
@@ -587,9 +596,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
-	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
+	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s robustBufferAccess2=%s "
+	     "storage_alignment=%u uniform_alignment=%u robust_buffer_dwords=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
+	     robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE ? "true" : "false",
+	     static_cast<uint32_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
+	     static_cast<uint32_t>(robustness2_properties.robustUniformBufferAccessSizeAlignment),
+	     graphics.robust_buffer_dwords_enabled ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};

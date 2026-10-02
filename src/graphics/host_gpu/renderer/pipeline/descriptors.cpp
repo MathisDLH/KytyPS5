@@ -134,7 +134,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	auto range    = size + adjustment;
+	if (graphics.robust_buffer_dwords_enabled && range >= sizeof(uint32_t)) {
+		// Robust checks may round the range up to a dword; shaders only see whole dwords.
+		range = Common::AlignDown(range, sizeof(uint32_t));
+	}
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}

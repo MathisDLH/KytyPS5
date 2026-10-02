@@ -9780,6 +9780,68 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+void TestNewShaderRecompilerRobustBufferDwordsSkipBoundsBranches() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x09, 12, 4),
+      0u,                      // s_buffer_load_dwordx2 s[12:13], s[8:11], s0
+      EncodeVop1(0x01, 2, 12), // v_mov_b32 v2, s12
+      EncodeVop1(0x01, 3, 13), // v_mov_b32 v3, s13
+      EncodeMubuf0(0x1d),
+      EncodeMubuf1(2, 0, 1), // buffer_store_dwordx2 v[2:3], v1
+      EncodeMubuf0(0x0c),
+      EncodeMubuf1(0, 0, 1), // buffer_load_dword v0, v1
+      EncodeMubuf0(0x08, 5),
+      EncodeMubuf1(4, 0, 1), // buffer_load_ubyte v4, v1 offset:5
+      EncodeMubuf0(0x18, 6),
+      EncodeMubuf1(4, 0, 1), // buffer_store_byte v4, v1 offset:6
+      EncodeMubuf0(0x32, 0, true, true),
+      EncodeMubuf1(0, 0, 1), // buffer_atomic_add v0, v1 glc
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 64> user_data{};
+  user_data[3] = 3u << 28u; // Raw bounds for the s[0:3] fixture.
+  user_data[8] = 0x2000u;
+  user_data[10] = 4u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto checked = RecompileForTest(shader, options);
+  options.robust_buffer_dwords = true;
+  const auto robust = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(checked.spirv);
+  CheckSpirvBinaryValidates(robust.spirv);
+  CheckSpirvPhiParents(robust.spirv);
+
+  // Two scalar-buffer loads, one dword load and one byte load rely on the
+  // device; the dword and byte stores and the atomic keep explicit guards.
+  constexpr uint32_t plain_loads = 4u;
+  constexpr uint32_t umin = 38u; // GLSLstd450UMin
+  const auto checked_metrics = MeasureSpirv(checked.spirv);
+  const auto robust_metrics = MeasureSpirv(robust.spirv);
+  Check(SpirvExtInstCount(robust.spirv, umin) ==
+            SpirvExtInstCount(checked.spirv, umin) + plain_loads,
+        "robust buffer dwords did not clamp exactly the unguarded loads");
+  Check(checked_metrics.conditional_branches ==
+            robust_metrics.conditional_branches + plain_loads,
+        "robust buffer dwords did not drop exactly the plain load branches");
+  Check(checked_metrics.array_lengths > robust_metrics.array_lengths &&
+            robust_metrics.array_lengths != 0u,
+        "robust buffer dwords queried lengths for unguarded loads or none for guarded stores");
+
+  // The atomic keeps a length query and a branch ahead of it.
+  const auto source = DisassembleSpirvBinary(robust.spirv);
+  const auto atomic = source.find("OpAtomicIAdd", 0);
+  const auto atomic_length = atomic == std::string::npos
+                                 ? std::string::npos
+                                 : source.rfind("OpArrayLength", atomic);
+  const auto atomic_branch = atomic_length == std::string::npos
+                                 ? std::string::npos
+                                 : source.find("OpBranchConditional", atomic_length);
+  Check(atomic != std::string::npos && atomic_length != std::string::npos &&
+            atomic_branch != std::string::npos && atomic_branch < atomic,
+        "robust buffer atomic lost its explicit bounds guard");
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -14370,6 +14432,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestNewShaderRecompilerRobustBufferDwordsSkipBoundsBranches();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
