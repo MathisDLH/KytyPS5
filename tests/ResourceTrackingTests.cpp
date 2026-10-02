@@ -3259,26 +3259,42 @@ void TestGraphicsPushConstantLayout() {
     }
     fixture.program.shader_info_complete = true;
   };
-  uint32_t cursor = 0;
+  PushDataWindow window;
   Fixture pixel(ShaderType::Pixel);
   AddUserData(pixel, 4);
-  AllocateBindings(pixel.program, cursor);
+  AllocateBindings(pixel.program, window);
   Check(
       pixel.program.bindings.UsesPushData() &&
           pixel.program.bindings.push_data_start_dword == 0 &&
           FindBinding(pixel.program.bindings,
                       DescriptorBindingKind::ShaderData) == nullptr,
       "pixel shader did not start the shared push-data block");
-  pixel.program.bindings.AdvancePushData(cursor);
+  pixel.program.bindings.AdvancePushData(window);
+  Check(window.begin == 4 && window.end == PushData::DwordCount,
+        "pixel data did not claim the front of the push-data window");
 
+  // Vertex data ends the block whatever the pixel stage claimed, so passes
+  // with and without pixel data can share one vertex program.
+  constexpr uint32_t VertexStart = PushData::DwordCount - 9;
+  for (const uint32_t first :
+       {0u, PushData::MeshDrawDwordCount, window.begin}) {
+    Fixture independent(ShaderType::Vertex);
+    AddUserData(independent, 9);
+    AllocateBindings(independent.program, {.begin = first});
+    Check(independent.program.bindings.UsesPushData() &&
+              independent.program.bindings.push_data_start_dword ==
+                  VertexStart,
+          "vertex push-data placement depended on the pixel stage");
+  }
   Fixture vertex(ShaderType::Vertex);
   AddUserData(vertex, 9);
-  AllocateBindings(vertex.program, cursor);
+  AllocateBindings(vertex.program, window);
   Check(vertex.program.bindings.UsesPushData() &&
-            vertex.program.bindings.push_data_start_dword == 4,
-        "vertex shader did not follow pixel data in the shared push-data block");
-  vertex.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "graphics push-data cursor advanced incorrectly");
+            vertex.program.bindings.push_data_start_dword == VertexStart,
+        "vertex shader did not end the shared push-data block");
+  vertex.program.bindings.AdvancePushData(window);
+  Check(window.begin == 4 && window.end == VertexStart,
+        "graphics push-data window advanced incorrectly");
 
   Fixture edge(ShaderType::Pixel);
   AddUserData(edge, NativePushConstantSize / sizeof(uint32_t));
@@ -3290,7 +3306,7 @@ void TestGraphicsPushConstantLayout() {
 
   Fixture spill(ShaderType::Pixel);
   AddUserData(spill, 20);
-  AllocateBindings(spill.program, cursor);
+  AllocateBindings(spill.program, window);
   Check(
       !spill.program.bindings.UsesPushData() &&
           spill.program.bindings.push_data_start_dword == PushData::NoStart &&
@@ -3298,14 +3314,29 @@ void TestGraphicsPushConstantLayout() {
                       DescriptorBindingKind::ShaderData) != nullptr,
       "a stage that exceeded the remaining shared push data did not spill to storage");
   const auto spill_layout = spill.program.bindings;
-  spill.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "a spilled stage consumed shared push-data space");
+  spill.program.bindings.AdvancePushData(window);
+  Check(window.begin == 4 && window.end == VertexStart,
+        "a spilled stage consumed shared push-data space");
 
   Fixture repeated_spill(ShaderType::Pixel);
   AddUserData(repeated_spill, 20);
-  AllocateBindings(repeated_spill.program, 20);
+  AllocateBindings(repeated_spill.program, {.begin = 20});
   Check(repeated_spill.program.bindings == spill_layout,
         "storage fallback retained an irrelevant attempted push-data position");
+
+  // Later vertex-pipeline stages stack below earlier ones and may fill the
+  // remaining gap exactly.
+  Fixture evaluation(ShaderType::TessellationEvaluation);
+  AddUserData(evaluation, VertexStart - 4);
+  AllocateBindings(evaluation.program, window);
+  Check(evaluation.program.bindings.UsesPushData() &&
+            evaluation.program.bindings.push_data_start_dword == 4,
+        "a vertex-pipeline stage did not fill the remaining push data");
+  evaluation.program.bindings.AdvancePushData(window);
+  Check(window.begin == window.end &&
+            window.StartFor(ShaderType::Pixel, 1) == PushData::NoStart &&
+            window.StartFor(ShaderType::Vertex, 1) == PushData::NoStart,
+        "an exactly filled push-data window still accepted data");
 }
 
 void TestResourceLimitIsTransactional() {

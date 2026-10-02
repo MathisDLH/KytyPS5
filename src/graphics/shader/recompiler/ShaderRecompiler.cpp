@@ -628,7 +628,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
-                             uint32_t push_data_start_dword) {
+                             IR::PushDataWindow                push_data_window) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
@@ -665,7 +665,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AllocateBindings(ir, push_data_window);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

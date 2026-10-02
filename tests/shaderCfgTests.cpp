@@ -132,7 +132,8 @@ TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
     ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
-    void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0) {
+    void *read_memory_data = nullptr,
+    ShaderRecompiler::IR::PushDataWindow push_data_window = {}) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -148,7 +149,7 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data_window);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -9917,7 +9918,7 @@ void TestMeshExportStorage() {
   options.input_info.vertex = &input;
   options.user_data = user_data;
   struct Case {
-    uint32_t subgroup_size, push_data_start;
+    uint32_t subgroup_size, push_data_begin;
     bool split;
   };
   const Case cases[] = {
@@ -9926,17 +9927,21 @@ void TestMeshExportStorage() {
       {32u, PushData::MeshDrawDwordCount, false}, {64u, PushData::MeshDrawDwordCount, false},
       {32u, PushData::DwordCount, false}, {64u, PushData::DwordCount, false},
   };
-  for (const auto [subgroup_size, push_data_start, split] : cases) {
+  for (const auto [subgroup_size, push_data_begin, split] : cases) {
     mesh.host_subgroup_size = subgroup_size;
     options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
     const auto result = RecompileForTest(
         split ? std::span{front} : std::span<const uint32_t>{monolithic},
-        options, nullptr, nullptr, push_data_start);
+        options, nullptr, nullptr, {.begin = push_data_begin});
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
-    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
+    Check(layout.UsesPushData() == (push_data_begin == PushData::MeshDrawDwordCount) &&
               layout.memory_offset_count == 1,
           "mesh shader did not retain its user-data placement and buffer offset");
+    const auto push_data_start = layout.UsesPushData() ? layout.push_data_start_dword : 0u;
+    Check(!layout.UsesPushData() ||
+              push_data_start + layout.ShaderDataDwords() == PushData::DwordCount,
+          "mesh shader data did not end the push-data block");
     const auto reg = std::ranges::find(layout.user_data_registers, 13u);
     Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
@@ -9946,7 +9951,7 @@ void TestMeshExportStorage() {
       const auto operand =
           std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
           " %uint_0 %uint_" +
-          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
+          std::to_string(dword + push_data_start);
       Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
             "mesh user SGPR or buffer offset loaded from the wrong storage");
     }
@@ -13775,8 +13780,8 @@ void TestGraphicsPushConstantPlacement() {
   options.user_data = user_data;
 
   constexpr uint32_t PushDataStart = 7;
-  auto placed =
-      RecompileForTest(shader, options, nullptr, nullptr, PushDataStart);
+  auto placed = RecompileForTest(shader, options, nullptr, nullptr,
+                                 {.begin = PushDataStart});
   Check(placed.program.bindings.UsesPushData() &&
             placed.program.bindings.push_data_start_dword == PushDataStart &&
             ShaderRecompiler::IR::FindBinding(placed.program.bindings,
@@ -13785,6 +13790,32 @@ void TestGraphicsPushConstantPlacement() {
   Check(SpirvHasMemberDecorationValue(placed.spirv, OffsetDecoration, 0),
         "SPIR-V push-data block did not use the canonical zero base");
   CheckSpirvBinaryValidates(placed.spirv);
+
+  // Vertex data ends the block whether or not pixel data precedes it.
+  const uint32_t vertex_shader[] = {
+      EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+  };
+  auto vertex_options = MakeCompileOptions(ShaderType::Vertex);
+  vertex_options.user_data = user_data;
+  const auto pixel_end =
+      PushDataStart + placed.program.bindings.ShaderDataDwords();
+  for (const uint32_t first : {0u, pixel_end}) {
+    const auto vertex = RecompileForTest(vertex_shader, vertex_options, nullptr,
+                                         nullptr, {.begin = first});
+    const auto &layout = vertex.program.bindings;
+    Check(layout.UsesPushData() &&
+              layout.push_data_start_dword + layout.ShaderDataDwords() ==
+                  ShaderRecompiler::IR::PushData::DwordCount,
+          "vertex shader data did not end the shared push-data block");
+    const auto operand = "vsharp %uint_0 %uint_" +
+                         std::to_string(layout.push_data_start_dword);
+    Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(vertex.spirv),
+                                         "OpAccessChain", operand.c_str()),
+          "vertex shader did not load user data from its push-data position");
+    CheckSpirvBinaryValidates(vertex.spirv);
+  }
 }
 
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
