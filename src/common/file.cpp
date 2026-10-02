@@ -64,6 +64,7 @@ SysFileTimeStruct DateTimeToFileTimeUtc(const DateTime& date_time) {
 struct File::FilePrivate {
 	sys_file_t*                  f;
 	std::unique_ptr<ArchiveFile> archive;
+	bool                         read_only = false;
 };
 
 File::File(): m_p(std::make_unique<FilePrivate>()) {
@@ -88,6 +89,14 @@ File::File(const std::filesystem::path& name, Mode mode): m_p(std::make_unique<F
 
 bool File::IsInvalid() const {
 	return m_p->f == nullptr && m_p->archive == nullptr;
+}
+
+bool File::HasPositionalRead() const {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	return m_p->read_only;
+#else
+	return false;
+#endif
 }
 
 bool File::Create(const std::filesystem::path& name) {
@@ -133,6 +142,9 @@ bool File::Open(const std::filesystem::path& name, Mode mode) {
 		return false;
 	}
 
+	// A read-only handle never resizes the file or holds buffered writes.
+	m_p->read_only = mode == Mode::Read;
+
 	return true;
 }
 
@@ -168,6 +180,7 @@ void File::Close() {
 		SysFileClose(m_p->f);
 		m_p->f = nullptr;
 	}
+	m_p->read_only = false;
 }
 
 uint64_t File::Size() const {
@@ -180,6 +193,14 @@ uint64_t File::Size() const {
 	if (m_p->f == nullptr) {
 		return 0;
 	}
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// stdio finds the size by seeking to the end and back; a read-only handle can ask fstat, which
+	// also leaves the position alone for concurrent positional readers.
+	if (m_p->read_only) {
+		return SysFileStatSize(*m_p->f);
+	}
+#endif
 
 	return SysFileSize(*m_p->f);
 }
@@ -259,6 +280,22 @@ void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	if (m_p->f != nullptr) {
 		SysFileRead(data, size, *m_p->f, bytes_read);
 	}
+}
+
+void File::ReadAt(void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read) {
+	EXIT_IF(IsInvalid());
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	if (m_p->read_only) {
+		SysFileReadAt(data, size, offset, *m_p->f, bytes_read);
+		return;
+	}
+#endif
+
+	const auto position = Tell();
+	Seek(offset);
+	Read(data, size, bytes_read);
+	Seek(position);
 }
 
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {

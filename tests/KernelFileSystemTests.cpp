@@ -334,6 +334,73 @@ void CheckArchiveMount(const std::filesystem::path &root) {
   Check(FileSystem::KernelClose(fd) == OK, "close last archive descriptor");
 }
 
+void CheckHostFileReads(const std::filesystem::path &root) {
+  std::vector<uint8_t> payload(3 * 4096 + 17);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 29 + 3);
+  }
+  Common::File fixture;
+  Check(fixture.Create(root / "host-read.bin"), "create host read fixture");
+  fixture.Write(payload.data(), static_cast<uint32_t>(payload.size()));
+  fixture.Close();
+  FileSystem::Mount(root, "/app0");
+
+  constexpr char Path[] = "/app0/host-read.bin";
+  constexpr int64_t Offset = 4096 - 19;
+  const auto end = static_cast<int64_t>(payload.size());
+  std::array<uint8_t, 97> bytes{};
+  const int fd = FileSystem::KernelOpen(Path, 0, 0);
+  Check(fd >= 3 && FileSystem::KernelLseek(fd, 5, 0) == 5 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), Offset) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 5,
+        "host pread leaves the descriptor position alone");
+  Check(FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + 5) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 5 + bytes.size(),
+        "host read continues from the descriptor position");
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), end - 9) == 9 &&
+            std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), end) == 0,
+        "host pread stops at end of file");
+  std::array<uint8_t, 40> first{}, second{};
+  const std::array iov{FileSystem::KernelIovec{first.data(), first.size()},
+                       FileSystem::KernelIovec{nullptr, 0},
+                       FileSystem::KernelIovec{second.data(), second.size()}};
+  const auto iovcnt = static_cast<int>(iov.size());
+  Check(FileSystem::KernelPreadv(fd, iov.data(), iovcnt, Offset) == 80 &&
+            std::equal(first.begin(), first.end(), payload.begin() + Offset) &&
+            std::equal(second.begin(), second.end(), payload.begin() + Offset + 40) &&
+            FileSystem::KernelPreadv(fd, iov.data(), iovcnt, end - 50) == 50 &&
+            std::equal(first.begin(), first.end(), payload.end() - 50) &&
+            std::equal(second.begin(), second.begin() + 10, payload.end() - 10) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 5 + bytes.size(),
+        "host preadv scatters, stops at end of file and keeps the position");
+  Check(FileSystem::KernelClose(fd) == OK, "close read-only host file");
+
+  const int rw = FileSystem::KernelOpen(Path, 2, 0);
+  const std::array<uint8_t, 10> patch{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  Check(rw >= 3 && FileSystem::KernelWrite(rw, patch.data(), patch.size()) == patch.size() &&
+            FileSystem::KernelRead(rw, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + patch.size()) &&
+            FileSystem::KernelPread(rw, bytes.data(), patch.size(), 0) == patch.size() &&
+            std::equal(patch.begin(), patch.end(), bytes.begin()),
+        "read after write continues past the written bytes and keeps them");
+  FileSystem::FileStat stat{};
+  Check(FileSystem::KernelLseek(rw, 0, 2) == end &&
+            FileSystem::KernelWrite(rw, patch.data(), patch.size()) == patch.size() &&
+            FileSystem::KernelFstat(rw, &stat) == OK && stat.st_size == end + 10 &&
+            FileSystem::KernelPread(rw, bytes.data(), bytes.size(), end) == patch.size() &&
+            std::equal(patch.begin(), patch.end(), bytes.begin()),
+        "writes extend the size seen by fstat and pread");
+  Check(FileSystem::KernelFtruncate(rw, end) == OK && FileSystem::KernelFstat(rw, &stat) == OK &&
+            stat.st_size == end &&
+            FileSystem::KernelPread(rw, bytes.data(), bytes.size(), end) == 0,
+        "truncation shrinks the size seen by fstat and pread");
+  Check(FileSystem::KernelClose(rw) == OK, "close read-write host file");
+  FileSystem::Umount("/app0");
+}
+
 void CheckUnicodePaths(const std::filesystem::path &root) {
   constexpr std::string_view HostDirectory =
       "Test\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
@@ -830,6 +897,7 @@ int main(int, char**) {
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());
+  CheckHostFileReads(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <random>
 #include <system_error>
 #include <vector>
@@ -635,10 +636,11 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	const auto pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	// Read only what was invalidated: the cached size may lag growth by other handles.
+	const auto count = static_cast<uint32_t>(std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), count);
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	file->f.Read(buf, count, &bytes_read);
 
 	file->mutex.Unlock();
 
@@ -753,21 +755,24 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
-	file->mutex.Lock();
+	// Positional reads leave the shared file position alone, so they need no lock.
+	const bool positional = file->f.HasPositionalRead();
+	if (!positional) {
+		file->mutex.Lock();
+	}
 
 	bool       is_invalid = file->f.IsInvalid();
-	auto       pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	const auto count = static_cast<uint32_t>(std::min<uint64_t>(nbytes, remaining));
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), count);
 	uint32_t bytes_read = 0;
-	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-	file->f.Seek(pos);
+	file->f.ReadAt(buf, count, static_cast<uint64_t>(offset), &bytes_read);
 
-	file->mutex.Unlock();
+	if (!positional) {
+		file->mutex.Unlock();
+	}
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
@@ -827,7 +832,12 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_EBADF;
 	}
 
-	Common::LockGuard lock(file->mutex);
+	// Positional reads leave the shared file position alone, so they need no lock.
+	const bool                       positional = file->f.HasPositionalRead();
+	std::optional<Common::LockGuard> lock;
+	if (!positional) {
+		lock.emplace(file->mutex);
+	}
 	if (file->directory) {
 		return KERNEL_ERROR_EISDIR;
 	}
@@ -848,9 +858,9 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_EIO;
 	}
 
-	const auto position  = file->f.Tell();
+	const auto position  = positional ? 0 : file->f.Tell();
 	const auto file_size = file->f.Size();
-	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
+	if (!positional && !file->f.Seek(static_cast<uint64_t>(offset))) {
 		return KERNEL_ERROR_EIO;
 	}
 	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
@@ -865,14 +875,19 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		if (positional) {
+			file->f.ReadAt(buffer.iov_base, count, static_cast<uint64_t>(offset + bytes_read),
+			               &bytes);
+		} else {
+			file->f.Read(buffer.iov_base, count, &bytes);
+		}
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {
 			break;
 		}
 	}
-	if (!file->f.Seek(position)) {
+	if (!positional && !file->f.Seek(position)) {
 		return KERNEL_ERROR_EIO;
 	}
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,

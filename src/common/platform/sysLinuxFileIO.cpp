@@ -118,6 +118,40 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 	}
 }
 
+void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f,
+                   uint32_t* bytes_read) {
+	uint32_t total = 0;
+	if (f.type == SYS_FILE_FILE) {
+		// pread leaves the descriptor offset and the stdio buffer alone.
+		const int fd = fileno(f.f);
+		while (total < size) {
+			const auto result = ::pread(fd, static_cast<uint8_t*>(data) + total, size - total,
+			                            static_cast<off_t>(offset + total));
+			if (result < 0 && errno == EINTR) {
+				continue;
+			}
+			if (result <= 0) {
+				break;
+			}
+			total += static_cast<uint32_t>(result);
+		}
+	}
+	if (bytes_read != nullptr) {
+		*bytes_read = total;
+	}
+}
+
+uint64_t SysFileStatSize(sys_file_t& f) {
+	if (f.type != SYS_FILE_FILE) {
+		return SysFileSize(f);
+	}
+	struct stat st {};
+	if (fstat(fileno(f.f), &st) != 0) {
+		return 0;
+	}
+	return static_cast<uint64_t>(st.st_size);
+}
+
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
 	if (f.type == SYS_FILE_FILE) {
 		size_t w = fwrite(data, 1, size, f.f);

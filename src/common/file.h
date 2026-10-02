@@ -64,12 +64,17 @@ public:
 	bool Unlink();
 
 	[[nodiscard]] bool IsInvalid() const;
+	// ReadAt of read-only host files uses pread, which touches no shared state, so concurrent
+	// callers need no lock. Windows has none: a positional ReadFile moves the file pointer.
+	[[nodiscard]] bool HasPositionalRead() const;
 
 	[[nodiscard]] bool IsEOF() const { return Tell() >= Size(); }
 
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
 	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	// Reads at offset and leaves the file position unchanged.
+	void ReadAt(void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read = nullptr);
 	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);

@@ -73,4 +73,13 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Reads at offset without using or moving the stream position.
+// NOLINTNEXTLINE(google-runtime-references)
+void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f,
+                   uint32_t* bytes_read = nullptr);
+// The size on disk, without seeking; excludes writes still buffered by stdio.
+uint64_t SysFileStatSize(sys_file_t& f); // NOLINT(google-runtime-references)
+#endif
+
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */
