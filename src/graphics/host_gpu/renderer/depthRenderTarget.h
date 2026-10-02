@@ -98,6 +98,19 @@ inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	return vk::ImageLayout::eDepthStencilReadOnlyOptimal;
 }
 
+// Depth and stencil write-disable are dynamic state, so every draw of a pass can share one
+// writable layout. Switching to a read-only layout only ends the pass.
+inline vk::ImageLayout depth_writable_layout(const RenderDepthInfo& depth) {
+	const auto available = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
+		return vk::ImageLayout::eDepthAttachmentOptimal;
+	}
+	if (!(available & vk::ImageAspectFlagBits::eDepth)) {
+		return vk::ImageLayout::eStencilAttachmentOptimal;
+	}
+	return vk::ImageLayout::eDepthStencilAttachmentOptimal;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEPTHRENDERTARGET_H_
