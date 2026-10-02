@@ -111,9 +111,13 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	access.robust      = state.robust_buffer_dwords;
+	// Robust accesses that still check bounds query the length on demand.
+	if (!access.robust) {
+		access.length = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
+		                          access.object_pointer, 0);
+	}
 	return access;
 }
 
@@ -171,8 +175,14 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index) {
+	auto length = access.length;
+	if (length == 0) {
+		length = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), length, access.object_pointer,
+		                          0);
+	}
 	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, length);
 	return in_bounds;
 }
 

@@ -9,8 +9,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  bool robust_buffer_dwords = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

@@ -265,6 +265,32 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = index};
 }
 
+// Robust buffers read zero from any dword at or past OpArrayLength, just as the explicit check
+// does. Ranges stay below 4 GiB, so dword 0x3fffffff is never in bounds; the clamp keeps byte
+// offsets within 32 bits for drivers that compute them in 32 bits.
+uint32_t RobustElementIndex(EmitterState& state, uint32_t index) {
+	return EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, index, ConstantU32(state, 0x3fffffffu));
+}
+
+template <typename Fn>
+uint32_t LoadElementOrZero(EmitterState& state, const MemoryResourceAccess& resource,
+                           uint32_t index, Fn&& load) {
+	if (resource.robust) {
+		return load(RobustElementIndex(state, index));
+	}
+	return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
+	                                  [&]() { return load(index); });
+}
+
+// Stores keep the explicit check: a device that bounds-checks 4-byte units would let a dword store
+// to a guest buffer smaller than one dword write past it.
+template <typename Fn>
+void StoreElementIfInBounds(EmitterState& state, const MemoryResourceAccess& resource,
+                            uint32_t index, Fn&& store) {
+	EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
+	                [&]() { store(index); });
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
 
@@ -274,9 +300,9 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	return LoadElementOrZero(ctx.state, resource, index, [&](uint32_t element) {
+		return LoadWordInBounds(ctx, resource, element);
+	});
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -293,10 +319,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto raw_index = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	return LoadElementOrZero(ctx.state, resource, index, [&](uint32_t element) {
+		return LoadSubwordInBounds(ctx, resource, address, element, bits, sign_extend);
+	});
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -543,8 +568,8 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		StoreWordInBounds(ctx, resource, index, data);
+	StoreElementIfInBounds(ctx.state, resource, index, [&](uint32_t element) {
+		StoreWordInBounds(ctx, resource, element, data);
 	});
 }
 
@@ -1220,12 +1245,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (mem.offset >= 4u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
 	}
-	const auto access    = PrepareMemoryResourceAccess(state, mem);
-	const auto element   = EmitMemoryElementIndex(state, access, index);
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
+	const auto access  = PrepareMemoryResourceAccess(state, mem);
+	const auto element = EmitMemoryElementIndex(state, access, index);
+	ctx.Define(inst, LoadElementOrZero(state, access, element, [&](uint32_t bounded) {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		               state, EmitMemoryElementPointer(state, access, bounded));
 	           }));
 }
 
