@@ -95,7 +95,7 @@ bool UsesFlattenedSrt(const Program& program) {
 	});
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
+void AllocateBindings(Program& program, PushDataWindow push_data_window) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -107,8 +107,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	next.push_data_start_dword = push_data_window.StartFor(program.stage, next.ShaderDataDwords());
 
 	if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.

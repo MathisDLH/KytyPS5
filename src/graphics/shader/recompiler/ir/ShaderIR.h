@@ -303,13 +303,25 @@ struct PushData {
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
 	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
-	}
 };
 
 static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
+
+// Push-data dwords not yet claimed by the stages of one pipeline. Pixel and compute data take the
+// front and vertex-pipeline data the back, so a stage's placement (baked into its module) does not
+// depend on the size of the stages on the other side. A stage that does not fit uses ShaderData.
+struct PushDataWindow {
+	uint32_t begin = 0;
+	uint32_t end   = PushData::DwordCount;
+
+	[[nodiscard]] constexpr uint32_t StartFor(ShaderType stage, uint32_t size) const {
+		if (size == 0 || begin > end || size > end - begin) {
+			return PushData::NoStart;
+		}
+		return stage == ShaderType::Pixel || stage == ShaderType::Compute ? begin : end - size;
+	}
+};
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
 	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
@@ -428,9 +440,14 @@ struct BindingLayout {
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
-	void AdvancePushData(uint32_t& cursor) const {
-		if (UsesPushData()) {
-			cursor = push_data_start_dword + ShaderDataDwords();
+	void AdvancePushData(PushDataWindow& window) const {
+		if (!UsesPushData()) {
+			return;
+		}
+		if (push_data_start_dword == window.begin) {
+			window.begin += ShaderDataDwords();
+		} else {
+			window.end = push_data_start_dword;
 		}
 	}
 
