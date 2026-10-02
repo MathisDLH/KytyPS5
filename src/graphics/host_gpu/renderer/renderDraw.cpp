@@ -397,6 +397,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
+	// Rectangle lists are never culled.
+	const bool        rect_list = Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
+	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+	if (!rect_list && mode.cull_back) {
+		cull_mode |= vk::CullModeFlagBits::eBack;
+	}
+	if (!rect_list && mode.cull_front) {
+		cull_mode |= vk::CullModeFlagBits::eFront;
+	}
+	vk_buffer.setCullMode(cull_mode);
+	vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+	                                 : vk::FrontFace::eCounterClockwise);
+
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.stencil_test_enable) {
 		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
@@ -674,6 +687,7 @@ struct PreparedVertexBuffers {
 	std::array<vk::Buffer, MaxBuffers>     buffers {};
 	std::array<vk::DeviceSize, MaxBuffers> offsets {};
 	std::array<vk::DeviceSize, MaxBuffers> sizes {};
+	std::array<vk::DeviceSize, MaxBuffers> strides {};
 	uint32_t                               count = 0;
 };
 
@@ -734,8 +748,9 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = sizes[i];
+		const auto& vertex  = vs_input_info.buffers[i];
+		const auto  size    = sizes[i];
+		prepared.strides[i] = vertex.stride;
 		if (size == 0) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
@@ -954,9 +969,10 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
 	if (prepared.count != 0) {
+		const auto* strides = PIPELINE_DYNAMIC_VERTEX_STRIDE ? prepared.strides.data() : nullptr;
 		// Guest descriptor bounds must survive allocation merging in the cache.
 		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		                             prepared.offsets.data(), prepared.sizes.data(), strides);
 	}
 }
 
@@ -1094,8 +1110,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1127,6 +1142,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        0, sizeof(draw_data), draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
+		vk_buffer.setPrimitiveTopology(topology);
+		vk_buffer.setPrimitiveRestartEnable(primitive_restart_enable ? VK_TRUE : VK_FALSE);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);

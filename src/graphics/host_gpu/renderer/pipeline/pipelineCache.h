@@ -35,16 +35,12 @@ struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       depth_bounds_test_enable = false;
 	float                      depth_min_bounds         = 0.0f;
 	float                      depth_max_bounds         = 0.0f;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
@@ -65,7 +61,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 126);
+static_assert(sizeof(PipelineStaticParameters) == 122);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -75,6 +71,14 @@ struct PipelineRenderingState {
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
+
+// Draws bind vertex strides dynamically. MoltenVK needs Metal 3.1 for that, so Apple keeps
+// strides in the pipeline key.
+#if defined(__APPLE__)
+inline constexpr bool PIPELINE_DYNAMIC_VERTEX_STRIDE = false;
+#else
+inline constexpr bool PIPELINE_DYNAMIC_VERTEX_STRIDE = true;
+#endif
 
 struct PipelineVertexInputState {
 	struct Binding {
@@ -140,8 +144,7 @@ public:
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
-	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              vk::PrimitiveTopology topology, const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 

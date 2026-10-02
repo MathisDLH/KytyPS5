@@ -61,6 +61,21 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
+// Draws set the exact topology dynamically; a pipeline only fixes its topology class. MoltenVK
+// emulates topologies Metal lacks, such as triangle fans, so Apple keeps the exact topology.
+vk::PrimitiveTopology TopologyClass(vk::PrimitiveTopology topology) {
+#if defined(__APPLE__)
+	return topology;
+#else
+	switch (topology) {
+		case vk::PrimitiveTopology::eLineStrip: return vk::PrimitiveTopology::eLineList;
+		case vk::PrimitiveTopology::eTriangleStrip:
+		case vk::PrimitiveTopology::eTriangleFan: return vk::PrimitiveTopology::eTriangleList;
+		default: return topology;
+	}
+#endif
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -672,7 +687,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    const GraphicsPrograms& programs) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -782,8 +797,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = topology;
-	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.topology                 = TopologyClass(topology);
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
@@ -793,13 +807,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	const bool rect_list             = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
+	// Cull mode and front face are dynamic; culled faces still select the polygon mode.
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -810,8 +822,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
 		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
 			const auto& buffer = vs_input_info.buffers[binding];
-			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
-			                                      .instance = buffer.fetch_index != 0};
+			key.vertex_input.bindings[binding] = {
+			    .stride   = PIPELINE_DYNAMIC_VERTEX_STRIDE ? 0u : buffer.stride,
+			    .instance = buffer.fetch_index != 0,
+			};
 		}
 		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
