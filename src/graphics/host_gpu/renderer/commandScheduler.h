@@ -31,6 +31,9 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Copies recorded here run before every command of the current submission. Returns null when
+	// commands recorded since the last Flush or Finish may use a resource last used at `last_use`.
+	[[nodiscard]] vk::CommandBuffer UploadCommand(uint64_t last_use);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -52,6 +55,8 @@ public:
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
+	friend struct CommandSchedulerTestAccess;
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
@@ -89,6 +94,8 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	vk::CommandBuffer            m_upload = nullptr;
+	uint64_t                     m_boundary_tick;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

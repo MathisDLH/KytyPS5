@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <optional>
 
@@ -95,7 +96,7 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
+      m_command_pool(graphics, m_master), m_command(*this), m_boundary_tick(m_master.CurrentTick()),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
@@ -173,12 +174,14 @@ void CommandScheduler::Flush() {
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
+	m_boundary_tick = CurrentTick();
 }
 
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
+	m_boundary_tick = CurrentTick();
 }
 
 void CommandScheduler::Finish() {
@@ -188,6 +191,7 @@ void CommandScheduler::Finish() {
 	}
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
+	m_boundary_tick = CurrentTick();
 	PopPendingOperations();
 }
 
@@ -349,8 +353,19 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
+	if (m_upload != nullptr) {
+		// Publish the hoisted copies to every command that follows them.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		m_upload.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+		                         nullptr, 0, nullptr);
+		EXIT_NOT_IMPLEMENTED(m_upload.end() != vk::Result::eSuccess);
+	}
+	const std::array buffers {m_upload, m_command.m_buffer};
+	const uint32_t   first    = m_upload == nullptr ? 1u : 0u;
+	auto&            graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	vk::Result result;
@@ -371,8 +386,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = static_cast<uint32_t>(buffers.size()) - first;
+		submit_info.pCommandBuffers      = buffers.data() + first;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
@@ -388,7 +403,31 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	m_upload           = nullptr;
 	return tick;
+}
+
+vk::CommandBuffer CommandScheduler::UploadCommand(uint64_t last_use) {
+	EXIT_IF(m_command.IsInvalid());
+	// A Wait on the current tick can submit while an operation still holds resources it acquired
+	// before, so only Flush and Finish, which run between operations, advance the boundary.
+	if (last_use >= m_boundary_tick) {
+		return nullptr;
+	}
+	if (m_upload == nullptr) {
+		m_upload = m_command_pool.Commit();
+		vk::CommandBufferBeginInfo begin_info {};
+		begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+		EXIT_NOT_IMPLEMENTED(m_upload.begin(&begin_info) != vk::Result::eSuccess);
+		// Earlier submissions may still access the destinations.
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		m_upload.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr,
+		                         0, nullptr);
+	}
+	return m_upload;
 }
 
 void CommandScheduler::BeginNext() {
