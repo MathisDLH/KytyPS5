@@ -187,6 +187,12 @@ struct StreamBufferTestAccess {
   }
 };
 
+struct CommandSchedulerTestAccess {
+  static bool HasUploads(const CommandScheduler &scheduler) {
+    return scheduler.m_upload != nullptr;
+  }
+};
+
 struct ImageTestAccess {
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
@@ -2173,6 +2179,67 @@ public:
         std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
+
+    // Upload copies run before the main command buffer of their submission,
+    // even when recorded after a command that reads their destination.
+    const auto upload_tick = scheduler.CurrentTick();
+    Require("SchedulerTimeline", "upload boundary",
+            !scheduler.UploadCommand(upload_tick) &&
+                !CommandSchedulerTestAccess::HasUploads(scheduler),
+            "an upload was hoisted ahead of commands that use its destination");
+    constexpr u32 upload_value = 0x600dcafeu;
+    auto upload_source =
+        CreateHostBuffer("SchedulerTimeline", sizeof(u32),
+                         vk::BufferUsageFlagBits::eTransferSrc, {upload_value});
+    auto upload_target = CreateHostBuffer(
+        "SchedulerTimeline", sizeof(u32),
+        vk::BufferUsageFlagBits::eTransferSrc |
+            vk::BufferUsageFlagBits::eTransferDst,
+        {0});
+    auto upload_readback =
+        CreateHostBuffer("SchedulerTimeline", sizeof(u32),
+                         vk::BufferUsageFlagBits::eTransferDst, {0});
+    const vk::BufferCopy upload_word{0, 0, sizeof(u32)};
+    const auto main_command = scheduler.Current().Handle();
+    main_command.copyBuffer(upload_target.buffer, upload_readback.buffer, 1,
+                            &upload_word);
+    vk::MemoryBarrier host_read{};
+    host_read.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    host_read.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    main_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                 vk::PipelineStageFlagBits::eHost, {}, 1,
+                                 &host_read, 0, nullptr, 0, nullptr);
+    const auto upload = scheduler.UploadCommand(upload_tick - 1);
+    Require("SchedulerTimeline", "upload command",
+            static_cast<bool>(upload) &&
+                scheduler.UploadCommand(upload_tick - 1) == upload,
+            "an idle destination did not get the submission's upload commands");
+    upload.copyBuffer(upload_source.buffer, upload_target.buffer, 1,
+                      &upload_word);
+    scheduler.Finish();
+    Require("SchedulerTimeline", "upload order",
+            !CommandSchedulerTestAccess::HasUploads(scheduler) &&
+                ReadBuffer("SchedulerTimeline", upload_readback, 1)[0] ==
+                    upload_value,
+            "upload commands did not run before their submission");
+
+    // A wait on the current tick can submit in the middle of an operation, so
+    // resources acquired before it stay in recording order until a flush.
+    const auto held_tick = scheduler.CurrentTick();
+    scheduler.Wait(held_tick);
+    Require("SchedulerTimeline", "upload boundary across wait",
+            scheduler.CurrentTick() == held_tick + 1 &&
+                !scheduler.UploadCommand(held_tick) &&
+                static_cast<bool>(scheduler.UploadCommand(held_tick - 1)),
+            "a mid-operation submission released resources acquired before it");
+    scheduler.Flush();
+    Require("SchedulerTimeline", "upload boundary after flush",
+            static_cast<bool>(scheduler.UploadCommand(held_tick + 1)),
+            "a flush kept the previous submission's resources in order");
+    scheduler.Finish();
+    DestroyBuffer(&upload_source);
+    DestroyBuffer(&upload_target);
+    DestroyBuffer(&upload_readback);
     scheduler.Shutdown();
 
     CommandScheduler draining(Renderer(), m_runtime_context);
@@ -4808,6 +4875,87 @@ public:
               "owner's dirty prefix");
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
+
+      // A Buffer this submission has not used yet takes its upload ahead of
+      // the submission; once the submission reads it, uploads stay in order.
+      constexpr uint64_t hoist_offset = 0x4800000;
+      constexpr uint64_t hoist_size = 2 * BufferCache::CACHING_PAGESIZE;
+      constexpr uint64_t hoist_bda_offset = hoist_offset + 0x10000;
+      constexpr uint64_t hoist_join_offset = hoist_offset + 0x20000;
+      constexpr uint32_t hoist_first = 0x5ca1ab1eu;
+      constexpr uint32_t hoist_second = 0x7e57da7au;
+      constexpr uint32_t hoist_bda = 0x0b5e55edu;
+      constexpr uint32_t hoist_join = 0x10ad5afeu;
+      const auto RecordReadback = [&](const Libs::Graphics::Buffer &buffer,
+                                      uint64_t offset, const Buffer &readback) {
+        const vk::BufferCopy copy{offset, 0, sizeof(uint32_t)};
+        const auto command = scheduler.Current().Handle();
+        command.copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eHost, {}, 1,
+                                &barrier, 0, nullptr, 0, nullptr);
+      };
+      auto first_readback =
+          CreateHostBuffer(name, sizeof(uint32_t),
+                           vk::BufferUsageFlagBits::eTransferDst, {0});
+      auto second_readback =
+          CreateHostBuffer(name, sizeof(uint32_t),
+                           vk::BufferUsageFlagBits::eTransferDst, {0});
+      Libs::LibKernel::Memory::WriteBacking(base + hoist_offset, &hoist_first,
+                                            sizeof(hoist_first));
+      scheduler.Finish();
+      const auto hoist_tick = scheduler.CurrentTick();
+      const auto [hoisted, hoisted_offset] =
+          cache.ObtainBuffer(base + hoist_offset, hoist_size, false);
+      Require(name, "idle Buffer upload",
+              hoisted != nullptr && hoisted->last_use_tick == hoist_tick &&
+                  CommandSchedulerTestAccess::HasUploads(scheduler),
+              "an upload into an unused Buffer interrupted the submission");
+      RecordReadback(*hoisted, hoisted_offset, first_readback);
+      Libs::LibKernel::Memory::WriteBacking(base + hoist_offset, &hoist_second,
+                                            sizeof(hoist_second));
+      cache.InvalidateMemory(base + hoist_offset, sizeof(hoist_second));
+      const auto [refreshed, refreshed_offset] =
+          cache.ObtainBuffer(base + hoist_offset, hoist_size, false);
+      RecordReadback(*refreshed, refreshed_offset, second_readback);
+      scheduler.Finish();
+      Require(name, "used Buffer upload order",
+              refreshed == hoisted &&
+                  ReadBuffer(name, first_readback, 1)[0] == hoist_first &&
+                  ReadBuffer(name, second_readback, 1)[0] == hoist_second,
+              "an upload overtook an earlier read of its Buffer");
+      DestroyBuffer(&first_readback);
+      DestroyBuffer(&second_readback);
+
+      Libs::LibKernel::Memory::WriteBacking(base + hoist_bda_offset, &hoist_bda,
+                                            sizeof(hoist_bda));
+      cache.SynchronizeBuffersInRange(base + hoist_offset, hoist_size);
+      const auto [bda_reachable, bda_reachable_offset] =
+          cache.ObtainBuffer(base + hoist_bda_offset, hoist_size, false);
+      Require(name, "device-address upload order",
+              bda_reachable != nullptr && bda_reachable != hoisted &&
+                  !CommandSchedulerTestAccess::HasUploads(scheduler) &&
+                  ReadNativeValue(*bda_reachable, bda_reachable_offset) ==
+                      hoist_bda,
+              "an upload overtook shaders that can reach every Buffer");
+
+      Libs::LibKernel::Memory::WriteBacking(base + hoist_join_offset,
+                                            &hoist_first, sizeof(hoist_first));
+      (void)cache.ObtainBuffer(base + hoist_join_offset, hoist_size, false);
+      scheduler.Finish();
+      Libs::LibKernel::Memory::WriteBacking(base + hoist_join_offset,
+                                            &hoist_join, sizeof(hoist_join));
+      cache.InvalidateMemory(base + hoist_join_offset, sizeof(hoist_join));
+      const auto [joined, joined_offset] =
+          cache.ObtainBuffer(base + hoist_join_offset, 2 * hoist_size, false);
+      Require(name, "merged Buffer upload order",
+              joined != nullptr && joined->Size() == 2 * hoist_size &&
+                  !CommandSchedulerTestAccess::HasUploads(scheduler) &&
+                  ReadNativeValue(*joined, joined_offset) == hoist_join,
+              "an upload overtook the copy that merged its Buffer");
 
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
